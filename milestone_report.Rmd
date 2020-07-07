@@ -1,0 +1,262 @@
+---
+title: "Milestone Report"
+author: "Nguyen Son Linh"
+date: "6/17/2020"
+output: 
+    html_document:
+        theme: cosmo
+---
+
+## Synopsis  
+In this report, I will try to develop an understanding of the properties of the training dataset, which will help build the final prediction model. Only English is used here.  
+
+## Setup  
+We will load the required packages and set the necessities.  
+
+```{r loadpackages, message=FALSE, echo=TRUE}
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(tm)
+library(RWeka)
+rm(list = ls(all.names = T))
+setwd("C:/Users/linhn/Documents/R/project/datasciencecapstone")
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(scipen = 1)
+```
+
+```{r readdata, message=FALSE, warning=FALSE}
+# Blogs
+blogsFileName <- "Data/final/en_US/en_US.blogs.txt"
+con <- file(blogsFileName, open = "r")
+blogs <- readLines(con, encoding = "UTF-8", skipNul = TRUE)
+close(con)
+
+# News
+newsFileName <- "Data/final/en_US/en_US.news.txt"
+con <- file(newsFileName, open = "r")
+news <- readLines(con, encoding = "UTF-8", skipNul = TRUE)
+close(con)
+
+# Twitter
+twitterFileName <- "Data/final/en_US/en_US.twitter.txt"
+con <- file(twitterFileName, open = "r")
+twitter <- readLines(con, encoding = "UTF-8", skipNul = TRUE)
+close(con)
+```
+
+## Basic data summary  
+Before any kind of analysis, a basic summary of the files is handy.  
+
+```{r basicsummary, echo=FALSE, results='hold', message=FALSE, warning=FALSE}
+library(stringi)
+file_size <- round(file.info(c(blogsFileName,
+                                newsFileName,
+                                twitterFileName))$size / 1024 ^ 2)
+no_lines <- sapply(list(blogs, news, twitter), length)
+no_char <- sapply(list(nchar(blogs), nchar(news), nchar(twitter)), sum)
+no_words <- sapply(list(blogs, news, twitter), stri_stats_latex)[4,]
+wpl <- lapply(list(blogs, news, twitter), function(x) stri_count_words(x))
+wplSummary <- sapply(list(blogs, news, twitter),
+             function(x) summary(stri_count_words(x))[c('Min.', 'Mean', 'Max.')])
+rownames(wplSummary) <- c('WPL.Min', 'WPL.Mean', 'WPL.Max')
+summary <- data.frame(
+    File = c("en_US.blogs.txt", "en_US.news.txt", "en_US.twitter.txt"),
+    FileSize = paste(file_size, " MB"),
+    Lines = no_lines,
+    Characters = no_char,
+    Words = no_words,
+    t(rbind(round(wplSummary)))
+)
+kable(summary,
+      row.names = FALSE,
+      align = c("l", rep("r", 7)),
+      caption = "")
+```
+
+From the summary table, it can be observed that each text file has low number of words per lines, with Tweets understandbly the lowest due to its short nature.  
+Also, all three files are extremely large, hence I will only take a 0.2% sample from each file for analysis in this report.  
+
+```{r wpldist, echo=FALSE, results='hold', message=FALSE}
+plot1 <- qplot(wpl[[1]], geom = "histogram", main = "Blogs", 
+               xlab = "Words per line", ylab = "Frequency", binwidth = 5)
+plot2 <- qplot(wpl[[2]], geom = "histogram", main = "News", 
+               xlab = "Words per line", ylab = "Frequency", binwidth = 5)
+plot3 <- qplot(wpl[[3]], geom = "histogram", main = "Tweets", 
+               xlab = "Words per line", ylab = "Frequency", binwidth = 1)
+plot1
+plot2
+plot3
+```
+
+## Sampling data  
+Now it's turn to prepare the sampling data. Also clean the data.  
+```{r sampledata, echo = FALSE}
+set.seed(4031)
+sample_size = 0.002
+
+sample_blogs = sample(blogs, length(blogs) * sample_size, replace = F)
+sample_news = sample(news, length(news) * sample_size, replace = F)
+sample_tweets = sample(twitter, length(twitter) * sample_size, replace = F)
+
+sample_blogs <- iconv(sample_blogs, "latin1", "ASCII", sub = "")
+sample_news <- iconv(sample_news, "latin1", "ASCII", sub = "")
+sample_tweets <- iconv(sample_tweets, "latin1", "ASCII", sub = "")
+
+sample_data <- c(sample_blogs, sample_news, sample_tweets)
+con <- file("data/sample.txt", open = "w")
+writeLines(sample_data, con)
+close(con)
+
+sample_data_lines <- length(sample_data)
+
+rm(blogs, news, twitter, sample_blogs, sample_news, sample_tweets)
+```
+
+Before conducting EDA, all three datasets are sampled without replacement at 1%.  
+All non-English characters are removed then the sample data will be written to a text file that has `r format(round(as.numeric(sample_data_lines)), big.mark = ",")` lines.  
+
+## Build corpus  
+After completing the above, we move on to build the corpus from the sampled data. The `tm` library will be utilised to do the following:  
+
+1. Remove URL, Twitter handle, etc. by converting them to spaces.  
+2. Convert all words to lowercase.  
+3. Remove all stopwords.  
+4. Remove punctuation marks, numbers, *profanity words*.  
+5. Cut whitespace.  
+
+For convienience, the output data will be written in the .RDS format.  
+
+Note: The profanity wordlist is obtained from [here](http://www.cs.cmu.edu/~biglou/resources/).  
+```{r corpusbuilder, echo=FALSE, message=FALSE, warning=FALSE}
+con <- file("Data/profanity.txt", open = "r")
+profanity_words <- readLines(con, encoding = "UTF-8", skipNul = TRUE)
+close(con)
+profanity_words <- iconv(profanity_words, "latin1", "ASCII", sub = "")
+
+corpusBuilder <- function(data, profanity){
+  docs <- VCorpus(VectorSource(data))
+  to_space <- content_transformer(function(string, pattern) gsub(pattern, " ", string))
+  
+  docs <- tm_map(docs, to_space, "(f|ht)tp(s?)://(.*)[.][a-z]+")
+  docs <- tm_map(docs, to_space, "@[^\\s]+")
+  docs <- tm_map(docs, to_space, "\\b[A-Z a-z 0-9._ - ]*[@](.*?)[.]{1,3} \\b")
+  
+  docs <- tm_map(docs, removeWords, profanity)
+  docs <- tm_map(docs, tolower)
+  docs <- tm_map(docs, removeWords, stopwords("english"))
+  docs <- tm_map(docs, removePunctuation)
+  docs <- tm_map(docs, removeNumbers)
+  docs <- tm_map(docs, stripWhitespace)
+  docs <- tm_map(docs, PlainTextDocument)
+  return(docs)
+}
+
+corpus <- corpusBuilder(sample_data, profanity_words)
+saveRDS(corpus, file = "Data/en_US.corpus.rds")
+
+```
+## Exploratory Data Analysis  
+After cleaning the data and build a corpus, we now do the EDA. More specifically, we will look at word frequencies and n-gram generation.  
+
+```{r wordfreq, message=FALSE, echo=FALSE}
+tdm <- TermDocumentMatrix(corpus)
+freq <- sort(rowSums(as.matrix(tdm)), decreasing = T)
+
+freq_table <- data.frame(word = names(freq), freq = freq)
+
+# Plot the 12 most frequent_words
+freq_table <- freq_table[1:12,]
+freq_table %>%
+  ggplot(aes(x = word, y = freq)) + 
+  geom_bar(stat = "Identity", fill = "black") +
+  coord_flip() +
+  ggtitle("12 Most Frequent Words") +
+  theme_minimal()
+
+rm(tdm, freq, freq_table)
+```
+
+```{r tokenisation,echo=FALSE, message=FALSE}
+unigram_tokeniser <- function(x) NGramTokenizer(x, Weka_control(min = 1, max = 1))
+bigram_tokeniser <- function(x) NGramTokenizer(x, Weka_control(min = 2, max = 2))
+trigram_tokeniser <- function(x) NGramTokenizer(x, Weka_control(min = 3, max = 3))
+```
+
+```{r unigramgeneration, echo=FALSE, message=FALSE}
+uni_tdm <- TermDocumentMatrix(corpus, control = list(tokenize = unigram_tokeniser))
+uni_freq <- sort(rowSums(as.matrix(removeSparseTerms(uni_tdm, 0.9999))), decreasing = T)
+uni_freq_table <- data.frame(word = names(uni_freq), freq = uni_freq)
+
+uni_freq_table <- uni_freq_table[1:15,]
+uni_freq_table %>%
+  ggplot(aes(x = word, y = freq)) +
+  geom_bar(stat = "Identity", fill = "black") +
+  coord_flip() +
+  ggtitle("15 Most Frequent Unigrams") +
+  theme_minimal()
+```
+
+```{r bigramgeneration, echo=FALSE, message=FALSE}
+bi_tdm <- TermDocumentMatrix(corpus, control = list(tokenize = bigram_tokeniser))
+bi_freq <- sort(rowSums(as.matrix(removeSparseTerms(bi_tdm, 0.9999))), decreasing = T)
+bi_freq_table <- data.frame(word = names(bi_freq), freq = bi_freq)
+
+bi_freq_table <- bi_freq_table[1:15,]
+bi_freq_table %>%
+  ggplot(aes(x = word, y = freq)) +
+  geom_bar(stat = "Identity", fill = "black") +
+  coord_flip() +
+  ggtitle("15 Most Frequent Bigrams") +
+  theme_minimal()
+```
+
+```{r trigramgeneration, echo=FALSE, message=FALSE}
+tri_tdm <- TermDocumentMatrix(corpus, control = list(tokenize = trigram_tokeniser))
+tri_freq <- sort(rowSums(as.matrix(removeSparseTerms(tri_tdm, 0.9999))), decreasing = T)
+tri_freq_table <- data.frame(word = names(tri_freq), freq = tri_freq)
+
+tri_freq_table <- tri_freq_table[1:15,]
+tri_freq_table %>%
+  ggplot(aes(x = word, y = freq)) +
+  geom_bar(stat = "Identity", fill = "black") +
+  coord_flip() +
+  ggtitle("15 Most Frequent Trigrams") +
+  theme_minimal()
+```
+
+## Conclusion  
+Based on the analysis, it is observed that when n in n-gram increases, the frequency decrease. Hence a viable strategy would be to predict an unigram following the entered phrase. When a full term is generated, look for bigrams and trigrams down the line.  
+
+## Appendix  
+Attached here are the codes to produce the charts in this document.  
+```{r basicsummary-appendix, ref.label='basicsummary', echo=TRUE, eval=FALSE}
+```
+
+```{r wpldist-appendix, ref.label='wpl', echo=TRUE, eval=FALSE}
+```
+
+```{r sampledata-appendix, ref.label='sampledata', echo=TRUE, eval=FALSE}
+```
+
+```{r corpusbuilder-appendix, ref.label='corpusbuilder', echo=TRUE, eval=FALSE}
+```
+
+```{r wordfreq-appendix, ref.label='wordfreq', echo=TRUE, eval=FALSE}
+```
+
+```{r tokenisation-appendix, ref.label='tokenisation', echo=TRUE, eval=FALSE}
+```
+
+```{r unigramgeneration-appendix, ref.label='unigramgeneration', echo=TRUE, eval=FALSE}
+```
+
+```{r bigramgeneration-appendix, ref.label='bigramgeneration', echo=TRUE, eval=FALSE}
+```
+
+```{r trigramgeneration-appendix, ref.label='trigramgeneration', echo=TRUE, eval=FALSE}
+```
+
